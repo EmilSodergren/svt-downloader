@@ -1,13 +1,11 @@
+use anyhow::{anyhow, ensure, Context, Error, Result};
 use percent_encoding::percent_decode_str;
 use serde::Deserialize;
 use std::fs::File;
 use std::io::BufReader;
-use std::io::{Error, ErrorKind};
-use std::path::PathBuf;
+use std::path::Path;
 use std::process::Command;
 use tiny_http::Server;
-
-type Result<T> = std::result::Result<T, Error>;
 
 #[derive(Deserialize, Debug)]
 struct Config {
@@ -17,57 +15,70 @@ struct Config {
 
 fn main() -> Result<()> {
     let file_reader = BufReader::new(File::open("config.json")?);
-    let config: Config = serde_json::from_reader(file_reader)?;
-    if !std::path::Path::new(&config.download_dir).exists() {
-        return Err(Error::new(ErrorKind::Other, "Download dir does not exist"));
-    }
-    let mut netrc_file = dirs::home_dir().ok_or(Error::new(ErrorKind::Other, "No home dir"))?;
+    let config: Config = serde_json::from_reader(file_reader).context("Can't read config file")?;
+    ensure!(
+        Path::new(&config.download_dir).exists(),
+        "Download dir does not exist"
+    );
+    let mut netrc_file = dirs::home_dir().ok_or(anyhow!("No home dir"))?;
     netrc_file.push(".netrc");
     let netrc_file_reader = BufReader::new(File::open(netrc_file.as_path())?);
-    let netrc = netrc::Netrc::parse(netrc_file_reader).map_err(|e| match e {
-        netrc::Error::Io(e) => e,
-        netrc::Error::Parse(s, _) => Error::new(ErrorKind::Other, s),
-    })?;
+    let netrc = netrc::Netrc::parse(netrc_file_reader)
+        .map_err(|err| match err {
+            netrc::Error::Io(e) => anyhow!("{}", e),
+            netrc::Error::Parse(s, _) => anyhow!("{}", s),
+        })
+        .context("Failed to read .netrc")?;
     std::env::set_current_dir(&config.download_dir)?;
     let server = Server::http(format!("0.0.0.0:{}", config.port)).unwrap();
     loop {
-        clear_dir();
-        println!("Listen for incoming urls on {}", config.port);
-        let request = match server.recv() {
-            Ok(rq) => rq,
-            Err(e) => {
-                return Err(Error::new(ErrorKind::Other, e));
-            }
+        match download_loop(&config, &server, &netrc) {
+            Ok(_) => {}
+            Err(err) => println!("{:?}", err),
         };
-        let url: Vec<&str> = request.url().split("=").collect();
-        let url = percent_decode_str(url[1])
-            .decode_utf8()
-            .map_err(|e| Error::new(ErrorKind::Other, e))?
-            .into_owned();
-        println!("Received request for downloading: {}", &url);
-        match download(&url) {
-            Ok(_) => {
-                request.respond(tiny_http::Response::empty(200))?;
-            }
-            Err(e) => {
-                request.respond(tiny_http::Response::empty(500))?;
-                return Err(e);
-            }
-        };
-        upload_ftp(&netrc).map_err(|e| Error::new(ErrorKind::Other, format!("{}", e)))?;
     }
 }
 
+fn download_loop(config: &Config, server: &Server, netrc: &netrc::Netrc) -> Result<()> {
+    clear_dir()?;
+    println!("Listen for incoming urls on {}", config.port);
+    let request = match server.recv() {
+        Ok(rq) => rq,
+        Err(e) => {
+            return Err(anyhow!("{}", e));
+        }
+    };
+    let url: Vec<&str> = request.url().split("=").collect();
+    let url = percent_decode_str(url[1])
+        .decode_utf8()
+        .context("Failed percent decode str")?;
+    println!("Received request for downloading: {}", &url);
+    match download(&url) {
+        Ok(_) => {
+            request.respond(tiny_http::Response::empty(200))?;
+        }
+        Err(e) => {
+            request.respond(tiny_http::Response::empty(500))?;
+            return Err(e);
+        }
+    };
+    upload_ftp(netrc).context("Upload failed")
+}
+
 fn download(url: &str) -> Result<()> {
-    let output = Command::new("svtplay-dl").arg(url).output()?;
+    let output = Command::new("svtplay-dl")
+        .arg("-q")
+        .arg("2200")
+        .arg("-Q")
+        .arg("600")
+        .arg("remux")
+        .arg(url)
+        .output()?;
 
     if output.status.success() {
         Ok(())
     } else {
-        Err(Error::new(
-            ErrorKind::Other,
-            format!("Svtplay-dl exited with status: {}", output.status),
-        ))
+        Err(anyhow!("Svtplay-dl exited with status: {}", output.status))
     }
 }
 
@@ -82,19 +93,24 @@ fn upload_ftp(netrc: &netrc::Netrc) -> Result<()> {
     Ok(())
 }
 
-fn clear_dir() {
-    std::fs::read_dir(".")
-        .unwrap()
-        .map(|res| res.map(|e| e.path()).unwrap())
-        .for_each(|f| std::fs::remove_file(f).unwrap());
+#[inline]
+fn list_folder() -> Result<std::fs::ReadDir> {
+    std::fs::read_dir(".").map_err(Error::msg)
 }
 
+fn clear_dir() -> Result<()> {
+    for entry in list_folder()? {
+        let path = entry?.path();
+        std::fs::remove_file(path).map_err(Error::msg)?;
+    }
+    Ok(())
+}
+
+// The download directory should never contain more than one file at a time.
+// Thus take(1)
 fn get_file_name() -> Result<String> {
-    Ok(std::fs::read_dir(".")?
-        .map(|res| res.map(|e| e.path()))
-        .collect::<Result<Vec<_>>>()?[0]
-        .to_owned()
-        .to_str()
-        .unwrap()
-        .to_owned())
+    for entry in list_folder()? {
+        return Ok(entry?.path().to_string_lossy().into_owned());
+    }
+    return Err(anyhow!("No file was found"));
 }
