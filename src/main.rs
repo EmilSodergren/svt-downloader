@@ -66,29 +66,39 @@ fn download_loop(config: &Config, server: &Server, netrc: &netrc::Netrc) -> Resu
 }
 
 fn download(url: &str) -> Result<()> {
+    println!("Downloading");
     let output = Command::new("svtplay-dl")
         .arg("-q")
         .arg("2200")
         .arg("-Q")
         .arg("600")
-        .arg("remux")
+        .arg("--remux")
+        .arg("--silent-semi")
         .arg(url)
         .output()?;
 
     if output.status.success() {
+        println!("Download complete");
         Ok(())
     } else {
-        Err(anyhow!("Svtplay-dl exited with status: {}", output.status))
+        Err(anyhow!(
+            "Svtplay-dl exited with {}\nStdout: {}\nStderr: {}",
+            output.status,
+            std::str::from_utf8(&output.stdout)?,
+            std::str::from_utf8(&output.stderr)?
+        ))
     }
 }
 
 fn upload_ftp(netrc: &netrc::Netrc) -> Result<()> {
     let (ref host, _) = netrc.hosts[0];
+    println!("Uploading to ftp");
     Command::new("lftp")
         .arg(format!("{}:21", host.to_string()))
         .arg("-e")
         .arg(format!("cd TvFromPi; put {}; exit 0", get_file_name()?))
         .output()?;
+    println!("Upload complete");
 
     Ok(())
 }
